@@ -29,4 +29,5 @@ jobs:
       - name: Sync and publish
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python scripts/sync.py --publish
+          PYTHONUNBUFFERED: "1"
+        run: python -u scripts/sync.py --publish

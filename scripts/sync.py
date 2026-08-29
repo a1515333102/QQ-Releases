@@ -37,10 +37,15 @@ UA = (
 )
 
 
+def log(msg: str, *, err: bool = False) -> None:
+    print(msg, file=sys.stderr if err else sys.stdout, flush=True)
+
+
 def make_opener() -> urllib.request.OpenerDirector:
     jar = http.cookiejar.CookieJar()
     opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
     # Seed cookies used by UrlSign / CDN.
+    log("warm-up: https://im.qq.com/index/ ...")
     try:
         opener.open(
             urllib.request.Request(
@@ -49,8 +54,9 @@ def make_opener() -> urllib.request.OpenerDirector:
             ),
             timeout=30,
         )
+        log("warm-up: ok")
     except Exception as exc:  # noqa: BLE001
-        print(f"warn: warm-up im.qq.com failed: {exc}", file=sys.stderr)
+        log(f"warn: warm-up im.qq.com failed: {exc}", err=True)
     return opener
 
 
@@ -71,10 +77,11 @@ def fetch_text(opener: urllib.request.OpenerDirector, urls: list[str]) -> str:
     last_err: Exception | None = None
     for url in urls:
         try:
+            log(f"GET {url}")
             return http_get(opener, url).decode("utf-8", errors="replace")
         except Exception as exc:  # noqa: BLE001
             last_err = exc
-            print(f"warn: failed {url}: {exc}", file=sys.stderr)
+            log(f"warn: failed {url}: {exc}", err=True)
     raise RuntimeError(f"all URLs failed: {urls}") from last_err
 
 
@@ -136,6 +143,7 @@ def url_needs_sign(url: str) -> bool:
 
 def sign_download_url(opener: urllib.request.OpenerDirector, raw_url: str) -> str:
     """Exchange a bare CDN URL for a time-limited signed URL."""
+    log("  UrlSign ...")
     req = urllib.request.Request(
         URL_SIGN_API,
         data=json.dumps({"url": raw_url}).encode("utf-8"),
@@ -164,24 +172,23 @@ def sign_download_url(opener: urllib.request.OpenerDirector, raw_url: str) -> st
     signed = ((payload.get("data") or {}).get("url") or "").strip()
     if not signed:
         raise RuntimeError("UrlSign returned empty url")
+    log("  signed ok")
     return signed
 
 
 def prepare_download_url(opener: urllib.request.OpenerDirector, url: str) -> str:
     if url_needs_sign(url):
-        signed = sign_download_url(opener, url)
-        print(f"  signed ok")
-        return signed
+        return sign_download_url(opener, url)
     return url
 
 
 def download_file(opener: urllib.request.OpenerDirector, url: str, dest: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists() and dest.stat().st_size > 0:
-        print(f"skip existing: {dest.name}")
+        log(f"skip existing: {dest.name}")
         return
 
-    print(f"download: {dest.name}")
+    log(f"download: {dest.name}")
     download_url = prepare_download_url(opener, url)
     tmp = dest.with_suffix(dest.suffix + ".part")
     if tmp.exists():
@@ -198,11 +205,24 @@ def download_file(opener: urllib.request.OpenerDirector, url: str, dest: Path) -
     )
     try:
         with opener.open(req, timeout=600) as resp, open(tmp, "wb") as f:
+            total = resp.headers.get("Content-Length")
+            total_mb = int(total) / (1024 * 1024) if total and total.isdigit() else None
+            written = 0
+            last_report = 0
             while True:
                 chunk = resp.read(1024 * 1024)
                 if not chunk:
                     break
                 f.write(chunk)
+                written += len(chunk)
+                # Report about every 25 MiB so CI logs stay readable.
+                if written - last_report >= 25 * 1024 * 1024:
+                    last_report = written
+                    done_mb = written / (1024 * 1024)
+                    if total_mb is not None:
+                        log(f"  ... {done_mb:.0f}/{total_mb:.0f} MiB")
+                    else:
+                        log(f"  ... {done_mb:.0f} MiB")
     except urllib.error.HTTPError as exc:
         if tmp.exists():
             tmp.unlink(missing_ok=True)
@@ -210,7 +230,7 @@ def download_file(opener: urllib.request.OpenerDirector, url: str, dest: Path) -
 
     tmp.replace(dest)
     size_mb = dest.stat().st_size / (1024 * 1024)
-    print(f"  saved {size_mb:.1f} MiB")
+    log(f"  saved {size_mb:.1f} MiB")
 
 
 def release_exists(tag: str) -> bool:
@@ -267,24 +287,24 @@ def main() -> int:
 
     opener = make_opener()
 
-    print("fetch pcConfig.json ...")
+    log("fetch pcConfig.json ...")
     pc = json.loads(fetch_text(opener, PC_CONFIG_URLS))
-    print("fetch linuxConfig.js ...")
+    log("fetch linuxConfig.js ...")
     linux = parse_linux_config_js(fetch_text(opener, LINUX_CONFIG_URLS))
 
     win_ver, lin_ver, items = collect_urls(pc, linux)
     if not items:
-        print("error: no download URLs found", file=sys.stderr)
+        log("error: no download URLs found", err=True)
         return 1
 
     tag = f"{win_ver}+{lin_ver}"
-    print(f"Windows: {win_ver}")
-    print(f"Linux:   {lin_ver}")
-    print(f"Tag:     {tag}")
-    print(f"Files:   {len(items)}")
+    log(f"Windows: {win_ver}")
+    log(f"Linux:   {lin_ver}")
+    log(f"Tag:     {tag}")
+    log(f"Files:   {len(items)}")
     for name, url in items:
-        print(f"  - {name}")
-        print(f"    {url}")
+        log(f"  - {name}")
+        log(f"    {url}")
 
     write_github_output("tag", tag)
     write_github_output("win_version", win_ver)
@@ -292,7 +312,8 @@ def main() -> int:
 
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     downloaded: list[Path] = []
-    for name, url in items:
+    for i, (name, url) in enumerate(items, start=1):
+        log(f"[{i}/{len(items)}] {name}")
         dest = DOWNLOAD_DIR / name
         download_file(opener, url, dest)
         downloaded.append(dest)
@@ -316,19 +337,21 @@ def main() -> int:
     write_github_output("body", body)
 
     if args.download_only and not args.publish:
-        print("done (download-only)")
+        log("done (download-only)")
         return 0
 
+    log(f"check existing release: {tag}")
     if release_exists(tag):
-        print(f"release {tag} already exists, skip publish")
+        log(f"release {tag} already exists, skip publish")
         write_github_output("skipped", "true")
         return 0
 
     title = f"QQ Windows {win_ver} / Linux {lin_ver}"
-    print(f"creating release {tag} ...")
+    total_mb = sum(p.stat().st_size for p in downloaded) / (1024 * 1024)
+    log(f"creating release {tag} ({len(downloaded)} files, {total_mb:.0f} MiB) ...")
     create_release(tag, title, body, downloaded)
     write_github_output("skipped", "false")
-    print("published")
+    log("published")
     return 0
 
 
