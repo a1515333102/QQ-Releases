@@ -8,8 +8,10 @@ import http.cookiejar
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -182,6 +184,98 @@ def prepare_download_url(opener: urllib.request.OpenerDirector, url: str) -> str
     return url
 
 
+def _curl_available() -> bool:
+    return shutil.which("curl") is not None
+
+
+def _download_with_curl(url: str, tmp: Path) -> None:
+    """Prefer curl: resume, connect timeout, abort on stalled transfer."""
+    # Abort if slower than 8 KiB/s for 90s (common hang after UrlSign on GH runners).
+    cmd = [
+        "curl",
+        "-fL",
+        "--connect-timeout",
+        "30",
+        "--retry",
+        "2",
+        "--retry-delay",
+        "3",
+        "--speed-limit",
+        "8192",
+        "--speed-time",
+        "90",
+        "-A",
+        UA,
+        "-H",
+        "Referer: https://im.qq.com/",
+        "-H",
+        "Origin: https://im.qq.com",
+        "-C",
+        "-",
+        "-o",
+        str(tmp),
+        "--",
+        url,
+    ]
+    log(f"  CDN via curl (resume={tmp.exists() and tmp.stat().st_size or 0} bytes) ...")
+    proc = subprocess.run(cmd, cwd=ROOT)
+    if proc.returncode != 0:
+        raise RuntimeError(f"curl exit {proc.returncode}")
+
+
+def _download_with_urllib(
+    opener: urllib.request.OpenerDirector, url: str, tmp: Path
+) -> None:
+    existing = tmp.stat().st_size if tmp.exists() else 0
+    headers = {
+        "User-Agent": UA,
+        "Accept": "*/*",
+        "Referer": "https://im.qq.com/",
+        "Origin": "https://im.qq.com",
+    }
+    if existing > 0:
+        headers["Range"] = f"bytes={existing}-"
+        log(f"  CDN via urllib resume from {existing} bytes ...")
+    else:
+        log("  CDN via urllib ...")
+
+    req = urllib.request.Request(url, headers=headers)
+    # Stall timeout: 120s without socket progress (connect + read).
+    with opener.open(req, timeout=120) as resp:
+        resumed = bool(existing and getattr(resp, "status", None) == 206)
+        with open(tmp, "ab" if resumed else "wb") as f:
+            if not resumed:
+                existing = 0
+            total_hdr = resp.headers.get("Content-Length")
+            content_range = resp.headers.get("Content-Range") or ""
+            total_mb = None
+            if content_range and "/" in content_range:
+                whole = content_range.rsplit("/", 1)[-1]
+                if whole.isdigit():
+                    total_mb = int(whole) / (1024 * 1024)
+            elif total_hdr and total_hdr.isdigit():
+                total_mb = (existing + int(total_hdr)) / (1024 * 1024)
+
+            written = existing
+            last_report = existing
+            last_beat = time.monotonic()
+            while True:
+                chunk = resp.read(1024 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+                written += len(chunk)
+                now = time.monotonic()
+                if written - last_report >= 25 * 1024 * 1024 or now - last_beat >= 30:
+                    last_report = written
+                    last_beat = now
+                    done_mb = written / (1024 * 1024)
+                    if total_mb is not None:
+                        log(f"  ... {done_mb:.0f}/{total_mb:.0f} MiB")
+                    else:
+                        log(f"  ... {done_mb:.0f} MiB")
+
+
 def download_file(opener: urllib.request.OpenerDirector, url: str, dest: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists() and dest.stat().st_size > 0:
@@ -189,48 +283,34 @@ def download_file(opener: urllib.request.OpenerDirector, url: str, dest: Path) -
         return
 
     log(f"download: {dest.name}")
-    download_url = prepare_download_url(opener, url)
     tmp = dest.with_suffix(dest.suffix + ".part")
-    if tmp.exists():
-        tmp.unlink()
+    max_attempts = 4
+    last_err: Exception | None = None
 
-    req = urllib.request.Request(
-        download_url,
-        headers={
-            "User-Agent": UA,
-            "Accept": "*/*",
-            "Referer": "https://im.qq.com/",
-            "Origin": "https://im.qq.com",
-        },
-    )
-    try:
-        with opener.open(req, timeout=600) as resp, open(tmp, "wb") as f:
-            total = resp.headers.get("Content-Length")
-            total_mb = int(total) / (1024 * 1024) if total and total.isdigit() else None
-            written = 0
-            last_report = 0
-            while True:
-                chunk = resp.read(1024 * 1024)
-                if not chunk:
-                    break
-                f.write(chunk)
-                written += len(chunk)
-                # Report about every 25 MiB so CI logs stay readable.
-                if written - last_report >= 25 * 1024 * 1024:
-                    last_report = written
-                    done_mb = written / (1024 * 1024)
-                    if total_mb is not None:
-                        log(f"  ... {done_mb:.0f}/{total_mb:.0f} MiB")
-                    else:
-                        log(f"  ... {done_mb:.0f} MiB")
-    except urllib.error.HTTPError as exc:
-        if tmp.exists():
-            tmp.unlink(missing_ok=True)
-        raise RuntimeError(f"HTTP {exc.code} downloading {dest.name}") from exc
+    for attempt in range(1, max_attempts + 1):
+        try:
+            # Re-sign every attempt: signed CDN URLs expire and stall often.
+            download_url = prepare_download_url(opener, url)
+            if _curl_available():
+                _download_with_curl(download_url, tmp)
+            else:
+                _download_with_urllib(opener, download_url, tmp)
+            if not tmp.exists() or tmp.stat().st_size <= 0:
+                raise RuntimeError("empty download")
+            tmp.replace(dest)
+            size_mb = dest.stat().st_size / (1024 * 1024)
+            log(f"  saved {size_mb:.1f} MiB")
+            return
+        except Exception as exc:  # noqa: BLE001
+            last_err = exc
+            log(f"  attempt {attempt}/{max_attempts} failed: {exc}", err=True)
+            # Keep .part for resume; drop it only on HTTP hard failures.
+            if isinstance(exc, urllib.error.HTTPError) and exc.code in (403, 404):
+                tmp.unlink(missing_ok=True)
+            if attempt < max_attempts:
+                time.sleep(min(5 * attempt, 20))
 
-    tmp.replace(dest)
-    size_mb = dest.stat().st_size / (1024 * 1024)
-    log(f"  saved {size_mb:.1f} MiB")
+    raise RuntimeError(f"download failed for {dest.name}: {last_err}") from last_err
 
 
 def release_exists(tag: str) -> bool:
@@ -310,14 +390,6 @@ def main() -> int:
     write_github_output("win_version", win_ver)
     write_github_output("linux_version", lin_ver)
 
-    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    downloaded: list[Path] = []
-    for i, (name, url) in enumerate(items, start=1):
-        log(f"[{i}/{len(items)}] {name}")
-        dest = DOWNLOAD_DIR / name
-        download_file(opener, url, dest)
-        downloaded.append(dest)
-
     links_md = ["### Official Download Links", "", "| File | URL |", "| --- | --- |"]
     for name, url in items:
         links_md.append(f"| `{name}` | {url} |")
@@ -333,17 +405,27 @@ def main() -> int:
             "Unofficial mirror. Copyright belongs to Tencent.",
         ]
     )
-    (DOWNLOAD_DIR / "RELEASE_NOTES.md").write_text(body + "\n", encoding="utf-8")
     write_github_output("body", body)
+
+    # Skip expensive CDN downloads when the release already exists.
+    if args.publish:
+        log(f"check existing release: {tag}")
+        if release_exists(tag):
+            log(f"release {tag} already exists, skip publish")
+            write_github_output("skipped", "true")
+            return 0
+
+    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    (DOWNLOAD_DIR / "RELEASE_NOTES.md").write_text(body + "\n", encoding="utf-8")
+    downloaded: list[Path] = []
+    for i, (name, url) in enumerate(items, start=1):
+        log(f"[{i}/{len(items)}] {name}")
+        dest = DOWNLOAD_DIR / name
+        download_file(opener, url, dest)
+        downloaded.append(dest)
 
     if args.download_only and not args.publish:
         log("done (download-only)")
-        return 0
-
-    log(f"check existing release: {tag}")
-    if release_exists(tag):
-        log(f"release {tag} already exists, skip publish")
-        write_github_output("skipped", "true")
         return 0
 
     title = f"QQ Windows {win_ver} / Linux {lin_ver}"
