@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import http.cookiejar
 import json
 import os
 import re
 import subprocess
 import sys
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -23,24 +25,53 @@ LINUX_CONFIG_URLS = [
     "https://cdn-go.cn/qq-web/im.qq.com_new/latest/rainbow/linuxConfig.js",
 ]
 
+# Same endpoint as im.qq.com SPA / NapCat UrlSign anti-hotlink.
+URL_SIGN_API = (
+    "https://im.qq.com/http2rpc/gotrpc/noauth/trpc.qqntv2.urlsign.UrlSign/GetSign"
+)
+URL_SIGN_OIDB = '{"uint32_command":"0x9b8e","uint32_service_type":1}'
 
-def http_get(url: str, timeout: int = 60) -> bytes:
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+)
+
+
+def make_opener() -> urllib.request.OpenerDirector:
+    jar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+    # Seed cookies used by UrlSign / CDN.
+    try:
+        opener.open(
+            urllib.request.Request(
+                "https://im.qq.com/index/",
+                headers={"User-Agent": UA, "Accept": "text/html,*/*"},
+            ),
+            timeout=30,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"warn: warm-up im.qq.com failed: {exc}", file=sys.stderr)
+    return opener
+
+
+def http_get(opener: urllib.request.OpenerDirector, url: str, timeout: int = 60) -> bytes:
     req = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "Mozilla/5.0 QQ-Releases-Mirror/1.0",
+            "User-Agent": UA,
             "Accept": "*/*",
+            "Referer": "https://im.qq.com/",
         },
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with opener.open(req, timeout=timeout) as resp:
         return resp.read()
 
 
-def fetch_text(urls: list[str]) -> str:
+def fetch_text(opener: urllib.request.OpenerDirector, urls: list[str]) -> str:
     last_err: Exception | None = None
     for url in urls:
         try:
-            return http_get(url).decode("utf-8", errors="replace")
+            return http_get(opener, url).decode("utf-8", errors="replace")
         except Exception as exc:  # noqa: BLE001
             last_err = exc
             print(f"warn: failed {url}: {exc}", file=sys.stderr)
@@ -64,31 +95,25 @@ def collect_urls(pc: dict, linux: dict) -> tuple[str, str, list[tuple[str, str]]
 
     items: list[tuple[str, str]] = []
 
-    win_keys = (
-        ("ntDownloadX64Url", "windows"),
-        ("ntDownloadUrl", "windows"),
-        ("ntDownloadARMUrl", "windows"),
-    )
-    for key, _ in win_keys:
+    for key in ("ntDownloadX64Url", "ntDownloadUrl", "ntDownloadARMUrl"):
         url = win.get(key)
         if isinstance(url, str) and url.startswith("http"):
-            items.append((Path(url).name, url))
+            items.append((Path(url.split("?", 1)[0]).name, url))
 
     def add_map(obj: object) -> None:
         if isinstance(obj, str) and obj.startswith("http"):
-            items.append((Path(obj).name, obj))
+            items.append((Path(obj.split("?", 1)[0]).name, obj))
             return
         if isinstance(obj, dict):
             for v in obj.values():
                 if isinstance(v, str) and v.startswith("http"):
-                    items.append((Path(v).name, v))
+                    items.append((Path(v.split("?", 1)[0]).name, v))
 
     add_map(lin.get("x64DownloadUrl"))
     add_map(lin.get("armDownloadUrl"))
     add_map(lin.get("loongarchDownloadUrl"))
     add_map(lin.get("mipsDownloadUrl"))
 
-    # de-dupe by filename, keep first
     seen: set[str] = set()
     unique: list[tuple[str, str]] = []
     for name, url in items:
@@ -100,24 +125,92 @@ def collect_urls(pc: dict, linux: dict) -> tuple[str, str, list[tuple[str, str]]
     return win_ver, lin_ver, unique
 
 
-def download_file(url: str, dest: Path) -> None:
+def url_needs_sign(url: str) -> bool:
+    lower = url.lower()
+    return (
+        "qqdl.gtimg.cn" in lower
+        or "qqntv2" in lower
+        or "gtimg.cn/qqfile" in lower
+    )
+
+
+def sign_download_url(opener: urllib.request.OpenerDirector, raw_url: str) -> str:
+    """Exchange a bare CDN URL for a time-limited signed URL."""
+    req = urllib.request.Request(
+        URL_SIGN_API,
+        data=json.dumps({"url": raw_url}).encode("utf-8"),
+        headers={
+            "User-Agent": UA,
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/plain, */*",
+            "x-oidb": URL_SIGN_OIDB,
+            "Origin": "https://im.qq.com",
+            "Referer": "https://im.qq.com/index/",
+        },
+        method="POST",
+    )
+    with opener.open(req, timeout=30) as resp:
+        payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+
+    retcode = payload.get("retcode", -1)
+    if retcode != 0:
+        msg = (
+            (payload.get("error") or {}).get("message")
+            or payload.get("message")
+            or "unknown"
+        )
+        raise RuntimeError(f"UrlSign retcode={retcode}: {msg}")
+
+    signed = ((payload.get("data") or {}).get("url") or "").strip()
+    if not signed:
+        raise RuntimeError("UrlSign returned empty url")
+    return signed
+
+
+def prepare_download_url(opener: urllib.request.OpenerDirector, url: str) -> str:
+    if url_needs_sign(url):
+        signed = sign_download_url(opener, url)
+        print(f"  signed ok")
+        return signed
+    return url
+
+
+def download_file(opener: urllib.request.OpenerDirector, url: str, dest: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists() and dest.stat().st_size > 0:
         print(f"skip existing: {dest.name}")
         return
+
     print(f"download: {dest.name}")
+    download_url = prepare_download_url(opener, url)
     tmp = dest.with_suffix(dest.suffix + ".part")
+    if tmp.exists():
+        tmp.unlink()
+
     req = urllib.request.Request(
-        url,
-        headers={"User-Agent": "Mozilla/5.0 QQ-Releases-Mirror/1.0"},
+        download_url,
+        headers={
+            "User-Agent": UA,
+            "Accept": "*/*",
+            "Referer": "https://im.qq.com/",
+            "Origin": "https://im.qq.com",
+        },
     )
-    with urllib.request.urlopen(req, timeout=600) as resp, open(tmp, "wb") as f:
-        while True:
-            chunk = resp.read(1024 * 1024)
-            if not chunk:
-                break
-            f.write(chunk)
+    try:
+        with opener.open(req, timeout=600) as resp, open(tmp, "wb") as f:
+            while True:
+                chunk = resp.read(1024 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+    except urllib.error.HTTPError as exc:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+        raise RuntimeError(f"HTTP {exc.code} downloading {dest.name}") from exc
+
     tmp.replace(dest)
+    size_mb = dest.stat().st_size / (1024 * 1024)
+    print(f"  saved {size_mb:.1f} MiB")
 
 
 def release_exists(tag: str) -> bool:
@@ -172,10 +265,12 @@ def main() -> int:
     if not args.download_only and not args.publish:
         args.download_only = True
 
+    opener = make_opener()
+
     print("fetch pcConfig.json ...")
-    pc = json.loads(fetch_text(PC_CONFIG_URLS))
+    pc = json.loads(fetch_text(opener, PC_CONFIG_URLS))
     print("fetch linuxConfig.js ...")
-    linux = parse_linux_config_js(fetch_text(LINUX_CONFIG_URLS))
+    linux = parse_linux_config_js(fetch_text(opener, LINUX_CONFIG_URLS))
 
     win_ver, lin_ver, items = collect_urls(pc, linux)
     if not items:
@@ -199,7 +294,7 @@ def main() -> int:
     downloaded: list[Path] = []
     for name, url in items:
         dest = DOWNLOAD_DIR / name
-        download_file(url, dest)
+        download_file(opener, url, dest)
         downloaded.append(dest)
 
     links_md = ["### Official Download Links", "", "| File | URL |", "| --- | --- |"]
