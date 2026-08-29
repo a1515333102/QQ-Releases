@@ -1,0 +1,13 @@
+downloads/
+latest_files/
+_*.js
+_*.json
+*.exe
+*.deb
+*.rpm
+*.AppImage
+*.dmg
+__pycache__/
+.venv/
+.DS_Store
+Thumbs.db
