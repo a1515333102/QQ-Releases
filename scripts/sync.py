@@ -20,12 +20,17 @@ ROOT = Path(__file__).resolve().parents[1]
 DOWNLOAD_DIR = ROOT / "downloads"
 
 PC_CONFIG_URLS = [
-    "https://cdn-go.cn/qq-web/im.qq.com_new/latest/rainbow/pcConfig.json",
+    # Prefer im.qq.com proxy: overseas CDN edges for cdn-go.cn often lag behind CN.
     "https://im.qq.com/proxy/domain/cdn-go.cn/qq-web/im.qq.com_new/latest/rainbow/pcConfig.json",
+    "https://qq-web.cdn-go.cn/im.qq.com_new/latest/rainbow/pcConfig.json",
+    "https://cdn-go.cn/qq-web/im.qq.com_new/latest/rainbow/pcConfig.json",
 ]
 LINUX_CONFIG_URLS = [
+    "https://im.qq.com/proxy/domain/cdn-go.cn/qq-web/im.qq.com_new/latest/rainbow/linuxConfig.js",
+    "https://qq-web.cdn-go.cn/im.qq.com_new/latest/rainbow/linuxConfig.js",
     "https://cdn-go.cn/qq-web/im.qq.com_new/latest/rainbow/linuxConfig.js",
 ]
+SEED_PC_CONFIG = ROOT / "scripts" / "seed-pcConfig.json"
 
 # Same endpoint as im.qq.com SPA / NapCat UrlSign anti-hotlink.
 URL_SIGN_API = (
@@ -62,29 +67,40 @@ def make_opener() -> urllib.request.OpenerDirector:
     return opener
 
 
+def version_key(v: object) -> tuple[int, ...]:
+    nums = [int(x) for x in re.findall(r"\d+", str(v or ""))]
+    return tuple(nums) if nums else (0,)
+
+
+def cache_bust(url: str) -> str:
+    sep = "&" if "?" in url else "?"
+    return f"{url}{sep}_={int(time.time() * 1000)}"
+
+
 def http_get(opener: urllib.request.OpenerDirector, url: str, timeout: int = 60) -> bytes:
     req = urllib.request.Request(
-        url,
+        cache_bust(url),
         headers={
             "User-Agent": UA,
             "Accept": "*/*",
             "Referer": "https://im.qq.com/",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
         },
     )
     with opener.open(req, timeout=timeout) as resp:
         return resp.read()
 
 
-def fetch_text(opener: urllib.request.OpenerDirector, urls: list[str]) -> str:
-    last_err: Exception | None = None
+def fetch_all_texts(opener: urllib.request.OpenerDirector, urls: list[str]) -> list[str]:
+    texts: list[str] = []
     for url in urls:
         try:
             log(f"GET {url}")
-            return http_get(opener, url).decode("utf-8", errors="replace")
+            texts.append(http_get(opener, url).decode("utf-8", errors="replace"))
         except Exception as exc:  # noqa: BLE001
-            last_err = exc
             log(f"warn: failed {url}: {exc}", err=True)
-    raise RuntimeError(f"all URLs failed: {urls}") from last_err
+    return texts
 
 
 def parse_linux_config_js(text: str) -> dict:
@@ -92,6 +108,102 @@ def parse_linux_config_js(text: str) -> dict:
     if not match:
         raise ValueError("cannot parse linuxConfig.js")
     return json.loads(match.group(1))
+
+
+def win_version_of(pc: dict) -> str:
+    return str((pc.get("Windows") or {}).get("version") or "")
+
+
+def linux_version_of(linux: dict) -> str:
+    return str((linux or {}).get("version") or "")
+
+
+def pick_newest_pc(candidates: list[dict]) -> dict:
+    if not candidates:
+        raise RuntimeError("no pcConfig candidates")
+    best = candidates[0]
+    for item in candidates[1:]:
+        if version_key(win_version_of(item)) > version_key(win_version_of(best)):
+            best = item
+    return best
+
+
+def pick_newest_linux(candidates: list[dict]) -> dict:
+    if not candidates:
+        return {}
+    best = candidates[0]
+    for item in candidates[1:]:
+        if version_key(linux_version_of(item)) > version_key(linux_version_of(best)):
+            best = item
+    return best
+
+
+def load_seed_pc() -> dict | None:
+    if not SEED_PC_CONFIG.is_file():
+        return None
+    try:
+        data = json.loads(SEED_PC_CONFIG.read_text(encoding="utf-8"))
+        log(f"seed pcConfig: Windows {win_version_of(data)}")
+        return data
+    except Exception as exc:  # noqa: BLE001
+        log(f"warn: bad seed pcConfig: {exc}", err=True)
+        return None
+
+
+def write_seed_pc(pc: dict) -> None:
+    SEED_PC_CONFIG.write_text(
+        json.dumps(pc, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    log(f"updated seed: Windows {win_version_of(pc)}")
+
+
+def fetch_pc_config(opener: urllib.request.OpenerDirector) -> dict:
+    candidates: list[dict] = []
+    for text in fetch_all_texts(opener, PC_CONFIG_URLS):
+        try:
+            data = json.loads(text)
+            log(f"  candidate Windows {win_version_of(data)}")
+            candidates.append(data)
+        except Exception as exc:  # noqa: BLE001
+            log(f"warn: bad pcConfig json: {exc}", err=True)
+    seed = load_seed_pc()
+    if seed:
+        candidates.append(seed)
+    if not candidates:
+        raise RuntimeError(f"all pcConfig URLs failed: {PC_CONFIG_URLS}")
+    best = pick_newest_pc(candidates)
+    log(f"selected Windows {win_version_of(best)}")
+    # Persist newer config so the next CI run still sees it if overseas CDN lags.
+    seed = load_seed_pc()
+    if seed is None or version_key(win_version_of(best)) > version_key(
+        win_version_of(seed)
+    ):
+        try:
+            write_seed_pc(best)
+        except Exception as exc:  # noqa: BLE001
+            log(f"warn: could not write seed: {exc}", err=True)
+    return best
+
+
+def fetch_linux_config(opener: urllib.request.OpenerDirector, pc: dict) -> dict:
+    candidates: list[dict] = []
+    pc_linux = pc.get("Linux")
+    if isinstance(pc_linux, dict) and pc_linux:
+        log(f"  candidate Linux {linux_version_of(pc_linux)} (from pcConfig)")
+        candidates.append(pc_linux)
+    for text in fetch_all_texts(opener, LINUX_CONFIG_URLS):
+        try:
+            data = parse_linux_config_js(text)
+            log(f"  candidate Linux {linux_version_of(data)} (linuxConfig.js)")
+            candidates.append(data)
+        except Exception as exc:  # noqa: BLE001
+            log(f"warn: bad linuxConfig: {exc}", err=True)
+    best = pick_newest_linux(candidates)
+    if not best:
+        raise RuntimeError("no Linux config found")
+    log(f"selected Linux {linux_version_of(best)}")
+    return best
 
 
 def collect_urls(pc: dict, linux: dict) -> tuple[str, str, list[tuple[str, str]]]:
@@ -361,16 +473,27 @@ def main() -> int:
         action="store_true",
         help="create GitHub release if this version tag does not exist",
     )
+    parser.add_argument(
+        "--update-seed",
+        action="store_true",
+        help="write scripts/seed-pcConfig.json from the newest fetched config",
+    )
     args = parser.parse_args()
-    if not args.download_only and not args.publish:
+    if not args.download_only and not args.publish and not args.update_seed:
         args.download_only = True
 
     opener = make_opener()
 
     log("fetch pcConfig.json ...")
-    pc = json.loads(fetch_text(opener, PC_CONFIG_URLS))
-    log("fetch linuxConfig.js ...")
-    linux = parse_linux_config_js(fetch_text(opener, LINUX_CONFIG_URLS))
+    pc = fetch_pc_config(opener)
+    log("fetch linux config ...")
+    linux = fetch_linux_config(opener, pc)
+
+    if args.update_seed:
+        write_seed_pc(pc)
+        if not args.download_only and not args.publish:
+            log("done (seed updated)")
+            return 0
 
     win_ver, lin_ver, items = collect_urls(pc, linux)
     if not items:
